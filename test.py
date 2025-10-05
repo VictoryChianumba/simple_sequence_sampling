@@ -89,12 +89,12 @@ def sample_topp(logits, p=0.9):
        
  
  
-tok = AutoTokenizer.from_pretrained("gpt2")
-model = AutoModelForCausalLM.from_pretrained("gpt2").eval().to("mps")
-prompt = "The quick brown fox"
-input_ids = tok(prompt, return_tensors="pt").input_ids.to("mps")
+# tok = AutoTokenizer.from_pretrained("gpt2")
+# model = AutoModelForCausalLM.from_pretrained("gpt2").eval().to("mps")
+# prompt = "The quick brown fox"
+# input_ids = tok(prompt, return_tensors="pt").input_ids.to("mps")
 
-greedy = lambda logits: sample_topp(logits)
-generated = generate(model, input_ids, max_new_tokens=20, sampling_fn = greedy, eos_token_id=tok.eos_token_id)
-print(tok.decode(generated['generated_ids'][0], skip_special_tokens=True))
-print("tokens per second: ", generated['tokens_per_sec'])
+# greedy = lambda logits: sample_topp(logits)
+# generated = generate(model, input_ids, max_new_tokens=20, sampling_fn = greedy, eos_token_id=tok.eos_token_id)
+# print(tok.decode(generated['generated_ids'][0], skip_special_tokens=True))
+# print("tokens per second: ", generated['tokens_per_sec'])

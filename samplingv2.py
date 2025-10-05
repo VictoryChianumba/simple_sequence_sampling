@@ -27,7 +27,6 @@ def generate_batch(model,
     torch.mps.synchronize() 
     start = time.perf_counter()
     outputs = model(input_ids, use_cache=True, return_dict=True)
-    print(outputs.logits.shape)
     prefill_time = time.perf_counter() - start    
     
     past_key_values = outputs.past_key_values
@@ -133,4 +132,4 @@ for b in BATCH_SIZES:
 
 
 df = pd.DataFrame(records)
-print(df.round(2))
+# print(df.round(2))
