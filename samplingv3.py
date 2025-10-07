@@ -99,8 +99,6 @@ def analyze_metrics(generator):
 class ContinuousBatchGenerator:
     def __init__(self, model, tokenizer, max_batch_size, max_seq_len):
         self.model = model
-        # In your __init__
-        # self.model = torch.compile(model, mode="reduce-overhead")
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
@@ -141,11 +139,13 @@ class ContinuousBatchGenerator:
             "input_ids": self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.model.device),
             "tokens_generated": 0,
             "finished": False,
+            "generated_tokens": [],
         }
         req_id = request["request_id"]
         self.next_request_id +=1
         self.pending_requests.append(request)
         self.metrics['request_submit_times'][req_id] = time.perf_counter()
+
         return req_id 
     
     def _initialize_cache_buffer(self, sample_cache):
@@ -184,12 +184,6 @@ class ContinuousBatchGenerator:
         
         # Promote pending -> active  
         while len(self.active_sequences) < self.max_batch_size and self.pending_requests:
-            # We find an empty slot
-            try:
-                empty_slot = self.active_slots.index(False)     
-            except ValueError:
-                break
-            
             req = self.pending_requests.pop(0)
             ids = req["input_ids"] 
             
@@ -197,103 +191,62 @@ class ContinuousBatchGenerator:
             with torch.no_grad():
                 out = self.model(ids, use_cache = True, return_dict = True)
             
-            # Initialise KV_cache_buffer when None
-            if self.kv_cache_buffer is None:
-                self._initialize_cache_buffer(out.past_key_values)
-                
-            seq_len = out.past_key_values[0][0].shape[2]
- 
-            # Copy the new KV cache to the allocated slot
-            for layer_idx, (k, v) in enumerate(out.past_key_values):
-                # Copy to the appropriate slot in our pre-allocated buffer
-                self.kv_cache_buffer[layer_idx][0][empty_slot, :, :seq_len, :] = k
-                self.kv_cache_buffer[layer_idx][1][empty_slot, :, :seq_len, :] = v
-            
-            # Mark slot as occupied and store request metadata
-            self.active_slots[empty_slot] = True
-            self.slot_to_request[empty_slot] = req
-            req["cache_slot"] = empty_slot  # Store slot index in request
-            req["current_seq_len"] = seq_len  # Track current sequence length
-            
+            # merge kv into global cache
+            new_kv = out.past_key_values
+            # Find the max sequence length in the current batch to pad the new sequence
+
+            self.past_key_values = add_sequence_to_cache(self.past_key_values, new_kv)            
             self.active_sequences.append(req)
-        
-        if not self.active_sequences:
-            return
-
-        # Extract active slots from buffer to pass to model
-        active_slot_indices = [seq['cache_slot'] for seq in self.active_sequences]
-        max_seq_len_in_batch = max(seq['current_seq_len'] for seq in self.active_sequences)
-
-        # Build cache for active sequences only
-        active_cache = []
-        for layer_idx in range(len(self.kv_cache_buffer)):
-            k_buffer, v_buffer = self.kv_cache_buffer[layer_idx]
-            # Extract only active slots, up to max_seq_len_in_batch
-            k_active = k_buffer[active_slot_indices, :, :max_seq_len_in_batch, :].contiguous()
-            v_active = v_buffer[active_slot_indices, :, :max_seq_len_in_batch, :].contiguous()
-            active_cache.append((k_active, v_active))
-
-        # Gather last tokens
-        last_tokens = torch.cat([seq["input_ids"][:, -1:] for seq in self.active_sequences], dim=0)
-
-        with torch.no_grad():
-            out = self.model(last_tokens, past_key_values=tuple(active_cache), use_cache=True, return_dict=True)
-            logits = out.logits[:, -1, :]
             
-            # Write updated cache back to buffer
-            for i, seq in enumerate(self.active_sequences):
-                slot = seq['cache_slot']
-                seq_len = seq['current_seq_len']
-                
-                # Sample next token
+        if not self.active_sequences:
+            return 
+        
+        last_tokens = torch.cat([seq["input_ids"][:, -1:] for seq in self.active_sequences], dim=0)
+        
+        with torch.no_grad():
+            out = self.model(last_tokens, 
+                                past_key_values=self.past_key_values,
+                                use_cache=True,
+                                return_dict=True)
+            logits = out.logits[:, -1, :]
+            self.past_key_values = out.past_key_values
+            
+            for i , seq in enumerate(self.active_sequences):
                 nxt = seq["sampling_fn"](logits[i:i+1, :])
-                seq["input_ids"] = torch.cat([seq["input_ids"], nxt], dim=1)
+                seq["input_ids"] = torch.cat([seq["input_ids"], nxt], dim=1)   
+                nxt_id = nxt.item()
+                # seq["generated_tokens"].append(nxt_id)
                 seq["tokens_generated"] += 1
-                
-                # Write updated KV for this sequence back to buffer
-                for layer_idx in range(len(self.kv_cache_buffer)):
-                    # Extract just the new token's KV
-                    new_k = out.past_key_values[layer_idx][0][i:i+1, :, -1:, :]
-                    new_v = out.past_key_values[layer_idx][1][i:i+1, :, -1:, :]
-                    
-                    # Update the cache at the right position
-                    self.kv_cache_buffer[layer_idx][0][slot, :, seq_len:seq_len+1, :] = new_k
-                    self.kv_cache_buffer[layer_idx][1][slot, :, seq_len:seq_len+1, :] = new_v
-                
-                seq['current_seq_len'] = seq_len + 1
-                
-                # Check if finished
-                if nxt.item() == self.tokenizer.eos_token_id or seq["tokens_generated"] >= seq["max_new_tokens"]:
-                    seq["finished"] = True 
+                if nxt_id == self.tokenizer.eos_token_id or \
+                    seq["tokens_generated"] >= seq["max_new_tokens"]:
+                        seq["finished"] = True  
                         
             self.decode_steps += 1
-
-            # Remove finished sequences
+            
             to_remove = [i for i, s in enumerate(self.active_sequences) if s["finished"]]
-
+            
+            for i in to_remove:
+                self.completed_sequences.append(self.active_sequences[i])
+                
+                
             for idx in to_remove:
                 seq = self.active_sequences[idx]
-                self.completed_sequences.append(seq)
-                
-                # Track latency
                 req_id = seq['request_id']
                 submit_time = self.metrics['request_submit_times'][req_id]
                 complete_time = time.perf_counter()
                 self.metrics['request_latencies'][req_id] = complete_time - submit_time
-                
-                # Free the slot
-                slot = seq['cache_slot']
-                self.active_slots[slot] = False
-                self.slot_to_request[slot] = None
-
-            # Remove from active list (in reverse to maintain indices)
+            
             for idx in reversed(to_remove):
                 self.active_sequences.pop(idx)
-
+                self.past_key_values = remove_sequence_from_cache(self.past_key_values, idx)
+                
+            # Track completed request latencies
+            
+                
             step_time = time.perf_counter() - step_start
             self.metrics['step_times'].append(step_time)
             self.metrics['batch_sizes'].append(len(self.active_sequences))
-                
+                    
         # print(f"Step {self.decode_steps}: Active={len(self.active_sequences)}, Pending={len(self.pending_requests)}")   
     
     def run_until_complete(self):

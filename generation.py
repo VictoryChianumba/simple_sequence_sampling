@@ -49,6 +49,9 @@ for original_req in requests_to_add:
     # Find the corresponding completed sequence
     for seq in generator.completed_sequences:
         if seq["prompt"] == original_req["prompt"]:
+            # Reconstruct full sequence from prompt + generated tokens
+            # full_ids = torch.cat([seq["input_ids"], torch.tensor([seq["generated_tokens"]], device='mps')], dim=1)
+            # decoded = tok.decode(full_ids[0], skip_special_tokens=True)
             print(f"Prompt: '{seq['prompt']}'")
             print(f"Generated: '{tok.decode(seq['input_ids'][0], skip_special_tokens=True)}'")
             print(f"Tokens generated: {seq['tokens_generated']}")
