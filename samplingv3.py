@@ -94,9 +94,13 @@ def analyze_metrics(generator):
     print(f"Latency p50/p90/p99: {p50:.3f}s / {p90:.3f}s / {p99:.3f}s")
     print(f"Average batch size: {avg_batch_size:.2f}")
     
+
+
 class ContinuousBatchGenerator:
     def __init__(self, model, tokenizer, max_batch_size, max_seq_len):
         self.model = model
+        # In your __init__
+        # self.model = torch.compile(model, mode="reduce-overhead")
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
@@ -111,6 +115,12 @@ class ContinuousBatchGenerator:
         self.completed_sequences = [] # Store finished sequences
         
         self.decode_steps = 0
+        
+        # Pre-allocated KV cache
+        self.max_cache_len = max_seq_len                                      
+        self.kv_cache_buffer = None  # Lazily initialize when we know layer config
+        self.active_slots = [False] * max_batch_size  # Track which slots are occupied
+        self.slot_to_request = [None] * max_batch_size  # Map slot index to request metadata
         
         # Benchmarking metrics
         self.metrics = {
@@ -138,6 +148,30 @@ class ContinuousBatchGenerator:
         self.metrics['request_submit_times'][req_id] = time.perf_counter()
         return req_id 
     
+    def _initialize_cache_buffer(self, sample_cache):
+        """Initialize pre-allocated cache based on model architecture."""
+        if self.kv_cache_buffer is not None:
+            return  # Already initialized
+        
+        num_layers = len(sample_cache)
+        # Get dimensions from first layer's key tensor
+        _, num_heads, _, head_dim = sample_cache[0][0].shape
+        device = sample_cache[0][0].device
+        dtype = sample_cache[0][0].dtype
+        
+        # Allocate buffer: list of (key_buffer, value_buffer) per layer
+        self.kv_cache_buffer = []
+        for _ in range(num_layers):
+            k_buffer = torch.zeros(
+                self.max_batch_size, num_heads, self.max_cache_len, head_dim,
+                dtype=dtype, device=device
+            )
+            v_buffer = torch.zeros(
+                self.max_batch_size, num_heads, self.max_cache_len, head_dim,
+                dtype=dtype, device=device
+            )
+            self.kv_cache_buffer.append((k_buffer, v_buffer))
+    
     def step(self):
         """
         One decode step for all active sequences.
@@ -150,6 +184,12 @@ class ContinuousBatchGenerator:
         
         # Promote pending -> active  
         while len(self.active_sequences) < self.max_batch_size and self.pending_requests:
+            # We find an empty slot
+            try:
+                empty_slot = self.active_slots.index(False)     
+            except ValueError:
+                break
+            
             req = self.pending_requests.pop(0)
             ids = req["input_ids"] 
             
@@ -157,62 +197,104 @@ class ContinuousBatchGenerator:
             with torch.no_grad():
                 out = self.model(ids, use_cache = True, return_dict = True)
             
-            # merge kv into global cache
-            new_kv = out.past_key_values
-            # Find the max sequence length in the current batch to pad the new sequence
-
-            self.past_key_values = add_sequence_to_cache(self.past_key_values, new_kv)            
+            # Initialise KV_cache_buffer when None
+            if self.kv_cache_buffer is None:
+                self._initialize_cache_buffer(out.past_key_values)
+                
+            seq_len = out.past_key_values[0][0].shape[2]
+ 
+            # Copy the new KV cache to the allocated slot
+            for layer_idx, (k, v) in enumerate(out.past_key_values):
+                # Copy to the appropriate slot in our pre-allocated buffer
+                self.kv_cache_buffer[layer_idx][0][empty_slot, :, :seq_len, :] = k
+                self.kv_cache_buffer[layer_idx][1][empty_slot, :, :seq_len, :] = v
+            
+            # Mark slot as occupied and store request metadata
+            self.active_slots[empty_slot] = True
+            self.slot_to_request[empty_slot] = req
+            req["cache_slot"] = empty_slot  # Store slot index in request
+            req["current_seq_len"] = seq_len  # Track current sequence length
+            
             self.active_sequences.append(req)
-            
+        
         if not self.active_sequences:
-            return 
-        
+            return
+
+        # Extract active slots from buffer to pass to model
+        active_slot_indices = [seq['cache_slot'] for seq in self.active_sequences]
+        max_seq_len_in_batch = max(seq['current_seq_len'] for seq in self.active_sequences)
+
+        # Build cache for active sequences only
+        active_cache = []
+        for layer_idx in range(len(self.kv_cache_buffer)):
+            k_buffer, v_buffer = self.kv_cache_buffer[layer_idx]
+            # Extract only active slots, up to max_seq_len_in_batch
+            k_active = k_buffer[active_slot_indices, :, :max_seq_len_in_batch, :].contiguous()
+            v_active = v_buffer[active_slot_indices, :, :max_seq_len_in_batch, :].contiguous()
+            active_cache.append((k_active, v_active))
+
+        # Gather last tokens
         last_tokens = torch.cat([seq["input_ids"][:, -1:] for seq in self.active_sequences], dim=0)
-        
+
         with torch.no_grad():
-            out = self.model(last_tokens, 
-                             past_key_values=self.past_key_values,
-                             use_cache=True,
-                             return_dict=True)
+            out = self.model(last_tokens, past_key_values=tuple(active_cache), use_cache=True, return_dict=True)
             logits = out.logits[:, -1, :]
-            self.past_key_values = out.past_key_values
             
-            for i , seq in enumerate(self.active_sequences):
+            # Write updated cache back to buffer
+            for i, seq in enumerate(self.active_sequences):
+                slot = seq['cache_slot']
+                seq_len = seq['current_seq_len']
+                
+                # Sample next token
                 nxt = seq["sampling_fn"](logits[i:i+1, :])
-                seq["input_ids"] = torch.cat([seq["input_ids"], nxt], dim=1)   
+                seq["input_ids"] = torch.cat([seq["input_ids"], nxt], dim=1)
                 seq["tokens_generated"] += 1
-                if nxt.item() == self.tokenizer.eos_token_id or \
-                    seq["tokens_generated"] >= seq["max_new_tokens"]:
-                        seq["finished"] = True  
+                
+                # Write updated KV for this sequence back to buffer
+                for layer_idx in range(len(self.kv_cache_buffer)):
+                    # Extract just the new token's KV
+                    new_k = out.past_key_values[layer_idx][0][i:i+1, :, -1:, :]
+                    new_v = out.past_key_values[layer_idx][1][i:i+1, :, -1:, :]
+                    
+                    # Update the cache at the right position
+                    self.kv_cache_buffer[layer_idx][0][slot, :, seq_len:seq_len+1, :] = new_k
+                    self.kv_cache_buffer[layer_idx][1][slot, :, seq_len:seq_len+1, :] = new_v
+                
+                seq['current_seq_len'] = seq_len + 1
+                
+                # Check if finished
+                if nxt.item() == self.tokenizer.eos_token_id or seq["tokens_generated"] >= seq["max_new_tokens"]:
+                    seq["finished"] = True 
                         
             self.decode_steps += 1
-            
+
+            # Remove finished sequences
             to_remove = [i for i, s in enumerate(self.active_sequences) if s["finished"]]
-            
-            for i in to_remove:
-                self.completed_sequences.append(self.active_sequences[i])
-                
+
             for idx in to_remove:
                 seq = self.active_sequences[idx]
+                self.completed_sequences.append(seq)
+                
+                # Track latency
                 req_id = seq['request_id']
                 submit_time = self.metrics['request_submit_times'][req_id]
                 complete_time = time.perf_counter()
                 self.metrics['request_latencies'][req_id] = complete_time - submit_time
-            
+                
+                # Free the slot
+                slot = seq['cache_slot']
+                self.active_slots[slot] = False
+                self.slot_to_request[slot] = None
+
+            # Remove from active list (in reverse to maintain indices)
             for idx in reversed(to_remove):
                 self.active_sequences.pop(idx)
-                self.past_key_values = remove_sequence_from_cache(self.past_key_values, idx)
-                
-            # Track completed request latencies
-           
-                
+
             step_time = time.perf_counter() - step_start
             self.metrics['step_times'].append(step_time)
             self.metrics['batch_sizes'].append(len(self.active_sequences))
                 
-        # print(f"Step {self.decode_steps}: Active={len(self.active_sequences)}, Pending={len(self.pending_requests)}")
-
-            
+        # print(f"Step {self.decode_steps}: Active={len(self.active_sequences)}, Pending={len(self.pending_requests)}")   
     
     def run_until_complete(self):
         """Keep stepping until all requests are done."""
@@ -223,114 +305,6 @@ class ContinuousBatchGenerator:
 tok = AutoTokenizer.from_pretrained("gpt2")
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
-model = AutoModelForCausalLM.from_pretrained("gpt2").eval().to("mps")
-
-# --- Key Change 1: Smaller batch size than total requests ---
-# generator = ContinuousBatchGenerator(
-#     model=model,
-#     tokenizer=tok,
-#     max_batch_size=2,  # Batch size is 2
-#     max_seq_len=100
-# )
-
-# # --- Key Change 2: Requests with different lengths ---
-# requests_to_add = [
-#     {"prompt": "The best thing about AI is", "max_new_tokens": 10},  # Short
-#     {"prompt": "In a world where technology has advanced", "max_new_tokens": 50}, # Long
-#     {"prompt": "Python is a great language because", "max_new_tokens": 10}, # Short
-#     {"prompt": "The history of machine learning began", "max_new_tokens": 50}, # Long
-# ]
+model = AutoModelForCausalLM.from_pretrained("gpt2", dtype=torch.float16).eval().to("mps")
 
 greedy = lambda logits: logits.argmax(dim=-1, keepdim=True)
-
-# print("--- Starting Generation ---")
-# for req in requests_to_add:
-#     req_id = generator.add_request(
-#         prompt=req["prompt"],
-#         max_new_tokens=req["max_new_tokens"],
-#         sampling_fn=greedy
-#     )
-#     print(f"Added request {req_id}: '{req['prompt']}' (max {req['max_new_tokens']} tokens)")
-
-# start = time.perf_counter()
-# generator.run_until_complete()
-# elapsed = time.perf_counter() - start
-
-# print("\n--- Generation Complete ---")
-# # Print results in the order they were added
-# print("\n--- Results ---")
-# for original_req in requests_to_add:
-#     # Find the corresponding completed sequence
-#     for seq in generator.completed_sequences:
-#         if seq["prompt"] == original_req["prompt"]:
-#             print(f"Prompt: '{seq['prompt']}'")
-#             print(f"Generated: '{tok.decode(seq['input_ids'][0], skip_special_tokens=True)}'")
-#             print(f"Tokens generated: {seq['tokens_generated']}")
-#             print("---")
-
-
-# print(f"\nTotal time: {elapsed:.2f}s")
-# print(f"Total decode steps: {generator.decode_steps}")
-
-# generator = ContinuousBatchGenerator(model, tok, max_batch_size=4, max_seq_len=100)
-# for i in range(8):
-#     generator.add_request(f"Prompt {i}", max_new_tokens=20, sampling_fn=greedy)
-
-# print("============== Short =============")
-# start = time.perf_counter()
-# generator.run_until_complete()
-# v3_time_s = time.perf_counter() - start
-# analyze_metrics(generator)
-# print(f"Total wall time: {v3_time_s:.6f}s\n")
-
-# generator = ContinuousBatchGenerator(model, tok, max_batch_size=4, max_seq_len=100)
-# # Alternate short and long
-# for i in range(4):
-#     generator.add_request(f"Short {i}", max_new_tokens=10, sampling_fn=greedy)
-#     generator.add_request(f"Long {i}", max_new_tokens=50, sampling_fn=greedy)
-
-# print("============== Short & Long =============")
-# start = time.perf_counter()
-# generator.run_until_complete()
-# v3_time_sl = time.perf_counter() - start
-# analyze_metrics(generator)
-# print(f"Total wall time: {v3_time_sl:.6f}s\n")
-
-# # Test naive batching (Version 2)
-# print("=== Naive Batching (Version 2) ===")
-# prompts = []
-# max_tokens = []
-# for i in range(4):
-#     prompts.append(f"Short {i}")
-#     max_tokens.append(10)
-#     prompts.append(f"Long {i}")
-#     max_tokens.append(50)
-
-# enc = tok(prompts, return_tensors="pt", padding=True).to("mps")
-# orig_lens = [len(tok.encode(p)) for p in prompts]
-
-# start = time.perf_counter()
-# result = generate_batch(model, enc.input_ids, max(max_tokens), greedy, tok.eos_token_id, tok.eos_token_id, orig_lens)
-# v2_time = time.perf_counter() - start
-
-# print(f"Total throughput: {result['tokens_per_sec']:.2f} tokens/sec")
-# print(f"Total wall time: {v2_time:.2f}s")
-
-# print(f"\nSpeedup SL: {v2_time / v3_time_sl:.2f}x")
-
-# Version 3: Mixed workload
-generator = ContinuousBatchGenerator(model, tok, max_batch_size=4, max_seq_len=100)
-short_ids = []
-long_ids = []
-for i in range(4):
-    short_ids.append(generator.add_request(f"Short {i}", max_new_tokens=10, sampling_fn=greedy))
-    long_ids.append(generator.add_request(f"Long {i}", max_new_tokens=50, sampling_fn=greedy))
-
-generator.run_until_complete()
-
-# Compare short vs long latencies
-short_latencies = [generator.metrics['request_latencies'][id] for id in short_ids]
-long_latencies = [generator.metrics['request_latencies'][id] for id in long_ids]
-
-print(f"Short request latencies: {np.mean(short_latencies):.2f}s")
-print(f"Long request latencies: {np.mean(long_latencies):.2f}s")
